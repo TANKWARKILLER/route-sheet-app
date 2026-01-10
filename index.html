@@ -164,6 +164,19 @@
       return (s || "").replace(/\s*\/\s*/g, "/");
     }
 
+function collapseHouseNumberSlashes(s) {
+  // Handles "301/300 LAKEWOOD PKWY" or "154/158/157 WALTON DR" -> keep first number
+  if (!s) return s;
+  let m = s.match(/^(\d{1,5})(?:\/\d{1,5})+\s+(.+)$/);
+  if (m) return `${m[1]} ${m[2]}`.trim();
+
+  // Handles "171 BRANTWOOD RD/170 BRANTWOOD RD" -> keep first address
+  m = s.match(/^(\d{1,5})\s+(.+?)\s*\/\s*(\d{1,5})\s+\2$/i);
+  if (m) return `${m[1]} ${m[2]}`.trim();
+
+  return s;
+}
+
     function cleanLine(s) {
       return (s || "")
         .replace(/\r/g, "")
@@ -274,6 +287,7 @@
       while ((m = stopAddrRegex.exec(text)) !== null) {
         let addr = cleanLine(m[1]);
         addr = normalizeSlashes(addr);
+        addr = collapseHouseNumberSlashes(addr);
         addr = stripBracketDir(addr);
         addr = stripTrailingPickupCount(addr);
         addr = normalizeIntersection(addr);
@@ -301,6 +315,7 @@
 
         // Normalize only safe things
         line = normalizeSlashes(line);
+        line = collapseHouseNumberSlashes(line);
         line = stripBracketDir(line);
         line = stripTrailingPickupCount(line);
 
@@ -339,6 +354,7 @@
             if (!look) continue;
             if (ignoreLineRe.test(look)) continue;
             look = normalizeSlashes(look);
+            look = collapseHouseNumberSlashes(look);
             look = stripBracketDir(look);
             look = stripTrailingPickupCount(look);
 
@@ -351,7 +367,8 @@
         if (!candidate) continue;
 
         candidate = cleanLine(candidate);
-        candidate = normalizeSlashes(candidate);       // KEEP slashes, just normalize spacing
+        candidate = normalizeSlashes(candidate);
+        candidate = collapseHouseNumberSlashes(candidate);       // KEEP slashes, just normalize spacing
         candidate = stripBracketDir(candidate);
         candidate = stripTrailingPickupCount(candidate);
         candidate = normalizeIntersection(candidate);
