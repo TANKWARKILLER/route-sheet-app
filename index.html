@@ -56,8 +56,8 @@
         <button id="analyze" disabled>Analyze (OCR + Extract)</button>
       </div>
 
-      <label class="small">Default city/state to append (optional)</label>
-      <input id="defaultPlace" type="text" placeholder="Example: Buffalo, NY  (or: Palm Coast, FL)" />
+      <label class="small">Default city/state to append (recommended)</label>
+      <input id="defaultPlace" type="text" placeholder="Example: Buffalo, NY   (or: Palm Coast, FL)" />
 
       <div class="checks">
         <label class="check">
@@ -75,7 +75,7 @@
       <div id="geoStatus" class="muted small"></div>
 
       <p class="muted small" style="margin-top:10px;">
-        Supports multiple formats. For “(stop) (12)” style sheets, the extractor reads the <b>stop lines</b> directly.
+        Calibrated for sheets that look like: <b>“6:52 am STOP 330 WEHRLE DR [N]”</b> and also “(stop) (12) … @ …”.
       </p>
     </div>
 
@@ -148,12 +148,15 @@
         .replace(/\bDrive\b/ig, "Dr")
         .replace(/\bLane\b/ig, "Ln")
         .replace(/\bParkway\b/ig, "Pkwy")
+        .replace(/\bHighway\b/ig, "Hwy")
         .replace(/\bCourt\b/ig, "Ct")
         .replace(/\bPlace\b/ig, "Pl")
         .replace(/\bTerrace\b/ig, "Ter")
+        .replace(/\bCircle\b/ig, "Cir")
         .replace(/\bDriveway\b/ig, "Drwy")
         .replace(/\bDRWY\b/ig, "Drwy")
-        .replace(/\bAV\b/ig, "Ave");
+        .replace(/\bAV\b/ig, "Ave")
+        .replace(/\bHWY\b/ig, "Hwy");
     }
 
     function cleanLine(s) {
@@ -176,8 +179,13 @@
     }
 
     function normalizeHouseNumberWeirdness(s) {
-      // Convert "20/18 FARRAGUT DR" -> "2018 FARRAGUT DR" (common OCR/format)
-      return s.replace(/^(\d{1,3})\/(\d{1,3})\b/, (m,a,b)=> `${a}${b}`);
+      // "20/18 FARRAGUT DR" -> "2018 FARRAGUT DR"
+      return s.replace(/^(\d{1,4})\s*\/\s*(\d{1,4})\b/, (m,a,b)=> `${a}${b}`);
+    }
+
+    function stripBracketDir(s) {
+      // Remove trailing direction tags like [N], [E], [NE]
+      return (s || "").replace(/\s*\[[A-Z]{1,3}\]\s*$/i, "").trim();
     }
 
     function looksLikeDepotText(t) {
@@ -191,7 +199,22 @@
         U.includes("COMPOUND") ||
         U.includes("PARKING LOT") ||
         U.includes("BUS BARN") ||
-        U.includes("MAINTENANCE")
+        U.includes("MAINTENANCE") ||
+        U.includes("BUS GARAGE")
+      );
+    }
+
+    function isTurnInstruction(line) {
+      const U = (line||"").toUpperCase();
+      return (
+        U.startsWith("LEFT TURN") ||
+        U.startsWith("RIGHT TURN") ||
+        U.startsWith("CONTINUE ON") ||
+        U.startsWith("START ON") ||
+        U.startsWith("BEAR RIGHT") ||
+        U.startsWith("BEAR LEFT") ||
+        U.startsWith("SHARP RIGHT") ||
+        U.startsWith("SHARP LEFT")
       );
     }
 
@@ -203,6 +226,10 @@
       const text = (rawText || "").replace(/\r/g, "\n");
       const lines = text.split("\n").map(cleanLine).filter(Boolean);
 
+      // STREET TYPE list for quick matching
+      const streetTypes = "(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|DR|DRIVE|LN|LANE|CT|COURT|PL|PLACE|TER|TERRACE|PKWY|PARKWAY|WAY|HWY|HIGHWAY|DRWY|DRIVEWAY|TRL|TRAIL|CIR|CIRCLE|CRVE|CURVE)";
+      const singleAddrRe = new RegExp("^\\d{1,6}\\s+.+\\s+" + streetTypes + "\\b.*$", "i");
+
       // 1) Structured "STOP_01 ... ADDRESS:"
       const stopAddrRegex = /STOP_\d+\s*[\s\S]*?ADDRESS:\s*([^\n]+)/gi;
       const outA = [];
@@ -210,42 +237,37 @@
       for (const m of text.matchAll(stopAddrRegex)) {
         let addr = normalizeStreetTypes(cleanLine(m[1] || ""));
         addr = normalizeHouseNumberWeirdness(addr);
+        addr = stripBracketDir(addr);
         if (!addr) continue;
+        if (ignoreDepot && looksLikeDepotText(addr)) continue;
         addr = appendDefaultPlace(addr, defaultPlace);
         const key = addr.toLowerCase();
         if (!seenA.has(key)) { seenA.add(key); outA.push(addr); }
       }
       if (outA.length > 0) return outA;
 
-      // 2) "(stop) (12) SOME ROAD @ OTHER" (Flagler-style)
+      // 2) Flagler style "(stop) (12) ... @ ..."
       const outB = [];
       const seenB = new Set();
-      const stopLineRe = /(\(\s*stop\s*\)\s*\(\s*\d+\s*\))\s*(.+)$/i;
+      const stopLineParenRe = /(\(\s*stop\s*\)\s*\(\s*\d+\s*\))\s*(.+)$/i;
       for (let i=0;i<lines.length;i++) {
         let line = stripTimePrefix(lines[i]);
         line = normalizeStreetTypes(line);
         line = normalizeHouseNumberWeirdness(line);
+        line = stripBracketDir(line);
 
-        const m = line.match(stopLineRe);
+        const m = line.match(stopLineParenRe);
         if (!m) continue;
 
         let loc = cleanLine(m[2] || "");
         if (!loc) continue;
 
-        // Convert separators to something Google understands
-        loc = loc.replace(/\s*@\s*/g, " & ");
-        loc = loc.replace(/\s*\/\s*/g, " & ");
-        loc = loc.replace(/\s+AT\s+/ig, " & ");
-
+        loc = loc.replace(/\s*@\s*/g, " & ").replace(/\s*\/\s*/g, " & ").replace(/\s+AT\s+/ig, " & ");
         if (ignoreDepot && looksLikeDepotText(loc)) continue;
-
-        const UL = loc.toUpperCase();
-        if (UL.startsWith("LEFT TURN") || UL.startsWith("RIGHT TURN") || UL.startsWith("CONTINUE ON") || UL.startsWith("START ON")) continue;
-
+        if (isTurnInstruction(loc)) continue;
         if (!captureIntersections && /\s&\s/.test(loc)) continue;
 
         loc = appendDefaultPlace(loc, defaultPlace);
-
         const key = loc.toLowerCase();
         if (seenB.has(key)) continue;
         seenB.add(key);
@@ -253,8 +275,77 @@
       }
       if (outB.length > 0) return outB;
 
-      // 3) Fallback: address lines and looser intersections
-      const streetTypes = "(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|DR|DRIVE|LN|LANE|CT|COURT|PL|PLACE|TER|TERRACE|PKWY|PARKWAY|WAY|HWY|HIGHWAY|DRWY|DRIVEWAY|TRL|TRAIL|CIR|CIRCLE)";
+      // 3) First Planning Solutions style: "6:52 am STOP 330 WEHRLE DR [N]"
+      const outC = [];
+      const seenC = new Set();
+      const headerRe = /^(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\s+(START|STOP|DEST|ORIGIN)\b\s*(.*)$/i;
+
+      for (let i=0;i<lines.length;i++) {
+        const line0 = normalizeStreetTypes(lines[i]);
+        const m = line0.match(headerRe);
+        if (!m) continue;
+
+        const kind = (m[2] || "").toUpperCase();
+        let payload = cleanLine(m[3] || "");
+        payload = normalizeHouseNumberWeirdness(payload);
+        payload = stripBracketDir(payload);
+
+        // Block end (next header)
+        let j = i + 1;
+        while (j < lines.length) {
+          const maybe = normalizeStreetTypes(lines[j]);
+          if (maybe.match(headerRe)) break;
+          j++;
+        }
+
+        if (kind !== "STOP") continue;
+
+        if (!payload) continue;
+        if (ignoreDepot && looksLikeDepotText(payload)) continue;
+
+        // Prefer a clean address inside the STOP block (often in the PICKUP column)
+        let best = "";
+        const blockLines = lines.slice(i, j).map(x => normalizeStreetTypes(cleanLine(x)));
+
+        let payloadStreetKey = "";
+        const payloadStreetMatch = payload.match(/^\d.*?\s+([A-Z0-9\s]+?\s+(?:ST|AVE|RD|BLVD|DR|LN|CT|PL|TER|PKWY|WAY|HWY|DRWY|TRL|CIR|CRVE))\b/i);
+        if (payloadStreetMatch) payloadStreetKey = cleanLine(payloadStreetMatch[1] || "").toUpperCase();
+
+        for (const bl of blockLines) {
+          if (!bl) continue;
+          const bl2 = stripBracketDir(normalizeHouseNumberWeirdness(bl));
+          if (isTurnInstruction(bl2)) continue;
+
+          const U = bl2.toUpperCase();
+          if (U.includes("PICKUP") || U.includes("DROPOFF")) continue;
+          if (U.startsWith("DAYS:") || U.startsWith("SCHOOL:") || U.startsWith("GRADE:")) continue;
+          if (!singleAddrRe.test(bl2)) continue;
+          if (ignoreDepot && looksLikeDepotText(bl2)) continue;
+
+          if (payloadStreetKey && U.includes(payloadStreetKey)) {
+            best = bl2;
+            break;
+          }
+          if (!best) best = bl2;
+        }
+
+        let stop = best || payload;
+
+        if (captureIntersections) {
+          stop = stop.replace(/\s*@\s*/g, " & ").replace(/\s*\/\s*/g, " & ").replace(/\s+AT\s+/ig, " & ");
+        }
+
+        stop = cleanLine(stop.replace(/\.+$/g, ""));
+        stop = appendDefaultPlace(stop, defaultPlace);
+
+        const key = stop.toLowerCase();
+        if (seenC.has(key)) continue;
+        seenC.add(key);
+        outC.push(stop);
+      }
+      if (outC.length > 0) return outC;
+
+      // 4) Fallback: address lines and loose intersections
       const addrLineRegex = new RegExp("^\\d{1,6}\\s+.+\\s+" + streetTypes + "\\b.*$", "i");
       const interRegexLoose = new RegExp("^(.+?\\s+" + streetTypes + ")\\s*(?:&|@|/|\\\\|\\bAND\\b|\\bAT\\b)\\s*(.+)$", "i");
 
@@ -262,13 +353,12 @@
       const seen = new Set();
 
       for (let i=0;i<lines.length;i++) {
-        let line = stripTimePrefix(lines[i]);
-        line = normalizeStreetTypes(line);
+        let line = normalizeStreetTypes(lines[i]);
         line = normalizeHouseNumberWeirdness(line);
+        line = stripBracketDir(line);
         if (!line) continue;
 
-        const UL = line.toUpperCase();
-        if (UL.startsWith("LEFT TURN") || UL.startsWith("RIGHT TURN") || UL.startsWith("CONTINUE ON") || UL.startsWith("START ON")) continue;
+        if (isTurnInstruction(line)) continue;
 
         let stop = null;
 
@@ -276,9 +366,7 @@
           stop = line;
         } else if (captureIntersections) {
           const m = line.match(interRegexLoose);
-          if (m) {
-            stop = cleanLine(m[1]) + " & " + cleanLine(m[2]);
-          }
+          if (m) stop = cleanLine(m[1]) + " & " + cleanLine(m[2]);
         }
 
         if (!stop) continue;
@@ -345,7 +433,7 @@
         }
         const isFile = window.location.protocol === "file:";
         els.geoStatus.innerHTML =
-          `<span class="warn">${msg}${isFile ? " (Use https or http://localhost for reliable GPS.)" : ""}</span>`;
+          `<span class="warn">${msg}${isFile ? " (Tip: open via https (GitHub Pages) or http://localhost for reliable GPS.)" : ""}</span>`;
       }
     }
     els.geo.addEventListener('click', requestLocation);
@@ -392,7 +480,7 @@
         els.stops.value = stops.join("\n");
 
         if (stops.length === 0) {
-          els.status.textContent = "No stops detected. Tip: set Default city/state, and keep 'Capture intersections' ON.";
+          els.status.textContent = "No stops detected. Tip: set Default city/state (e.g., Buffalo, NY) and try again.";
           els.build.disabled = true;
         } else {
           els.status.textContent = `Extracted ${stops.length} stop(s). Review/edit if needed (order preserved).`;
