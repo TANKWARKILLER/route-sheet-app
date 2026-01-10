@@ -219,168 +219,153 @@
     }
 
     function extractStopsFromText(rawText, opts) {
-      const defaultPlace = opts.defaultPlace || "";
-      const ignoreDepot = !!opts.ignoreDepot;
-      const captureIntersections = !!opts.captureIntersections;
+      const defaultPlace = (opts && opts.defaultPlace) ? String(opts.defaultPlace).trim() : "";
+      const ignoreDepot = !!(opts && opts.ignoreDepot);
+      const captureIntersections = !!(opts && opts.captureIntersections);
 
       const text = (rawText || "").replace(/\r/g, "\n");
-      const lines = text.split("\n").map(cleanLine).filter(Boolean);
+      const linesRaw = text.split("\n").map(cleanLine).filter(Boolean);
 
-      // STREET TYPE list for quick matching
-      const streetTypes = "(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|DR|DRIVE|LN|LANE|CT|COURT|PL|PLACE|TER|TERRACE|PKWY|PARKWAY|WAY|HWY|HIGHWAY|DRWY|DRIVEWAY|TRL|TRAIL|CIR|CIRCLE|CRVE|CURVE)";
-      const singleAddrRe = new RegExp("^\\d{1,6}\\s+.+\\s+" + streetTypes + "\\b.*$", "i");
+      // Helpers
+      const streetTypes = [
+        "ST","STREET","AVE","AV","AVENUE","RD","ROAD","BLVD","BOULEVARD","LN","LANE","DR","DRIVE",
+        "CT","COURT","PL","PLACE","PKWY","PARKWAY","TER","TERRACE","CIR","CIRCLE","TRL","TRAIL",
+        "HWY","HIGHWAY","WAY","SQ","SQUARE","RUN","PLZ","PLAZA","PT","POINT","BL","BAY","XING","CROSSING",
+        "DRWY","DRIVEWAY","CRVE","CURVE"
+      ];
 
-      // 1) Structured "STOP_01 ... ADDRESS:"
+      const typeRe = streetTypes.join("|");
+      const hasStreetType = new RegExp("\\b(" + typeRe + ")\\b", "i");
+      const looksLikeAddress = (s) => {
+        if (!s) return false;
+        const x = s.trim();
+
+        // Must contain either a house-number-ish token OR an intersection marker
+        const hasNum = /^\d{1,6}([\/-]\d{1,6})*/.test(x) || /\b\d{1,6}([\/-]\d{1,6})+\b/.test(x);
+        const hasAt = /\s(@|AT)\s/i.test(x) || /\s&\s/.test(x);
+
+        // Common stop rows are like: "330 WEHRLE DR [N]" or "FOREST HILL DR @ FRIAR WAY"
+        if (hasAt) return true;
+        if (hasNum && hasStreetType.test(x)) return true;
+
+        return false;
+      };
+
+      const stripTrailingPickupCount = (s) => {
+        // Removes a trailing lone pickup count like "... [E]  1"
+        // but does NOT touch things like "APT 1" (rare on these sheets)
+        return s.replace(/\s{2,}(\d{1,2})\s*$/, "");
+      };
+
+      const normalizeIntersection = (s) => {
+        // Keep slash house numbers as-is. Only normalize intersection tokens.
+        // Convert "X @ Y" or "X AT Y" to "X & Y" for Google Maps.
+        if (!captureIntersections) return s;
+        let x = s.replace(/\s+\@\s+/g, " & ").replace(/\s+\bAT\b\s+/gi, " & ");
+        // If it already has &, leave it.
+        return x;
+      };
+
+      // 0) First try: Structured "STOP_01 ... ADDRESS:" (your earlier Buffalo-style test sheets)
       const stopAddrRegex = /STOP_\d+\s*[\s\S]*?ADDRESS:\s*([^\n]+)/gi;
-      const outA = [];
-      const seenA = new Set();
-      for (const m of text.matchAll(stopAddrRegex)) {
-        let addr = normalizeStreetTypes(cleanLine(m[1] || ""));
+      const outStructured = [];
+      const seenStructured = new Set();
+      let m;
+      while ((m = stopAddrRegex.exec(text)) !== null) {
+        let addr = cleanLine(m[1]);
         addr = normalizeSlashes(addr);
         addr = stripBracketDir(addr);
+        addr = stripTrailingPickupCount(addr);
+        addr = normalizeIntersection(addr);
         if (!addr) continue;
         if (ignoreDepot && looksLikeDepotText(addr)) continue;
         addr = appendDefaultPlace(addr, defaultPlace);
         const key = addr.toLowerCase();
-        if (!seenA.has(key)) { seenA.add(key); outA.push(addr); }
+        if (!seenStructured.has(key)) { seenStructured.add(key); outStructured.push(addr); }
       }
-      if (outA.length > 0) return outA;
+      if (outStructured.length) return outStructured;
 
-      // 2) Flagler style "(stop) (12) ... @ ..."
-      const outB = [];
-      const seenB = new Set();
-      const stopLineParenRe = /(\(\s*stop\s*\)\s*\(\s*\d+\s*\))\s*(.+)$/i;
-      for (let i=0;i<lines.length;i++) {
-        let line = stripTimePrefix(lines[i]);
-        line = normalizeStreetTypes(line);
-        line = normalizeSlashes(line);
-        line = stripBracketDir(line);
-
-        const m = line.match(stopLineParenRe);
-        if (!m) continue;
-
-        let loc = cleanLine(m[2] || "");
-        if (!loc) continue;
-
-        loc = loc.replace(/\s*@\s*/g, " & ").replace(/\s+AT\s+/ig, " & ");
-        loc = normalizeSlashes(loc);
-        if (ignoreDepot && looksLikeDepotText(loc)) continue;
-        if (isTurnInstruction(loc)) continue;
-        if (!captureIntersections && /\s&\s/.test(loc)) continue;
-
-        loc = appendDefaultPlace(loc, defaultPlace);
-        const key = loc.toLowerCase();
-        if (seenB.has(key)) continue;
-        seenB.add(key);
-        outB.push(loc);
-      }
-      if (outB.length > 0) return outB;
-
-      // 3) First Planning Solutions style: "6:52 am STOP 330 WEHRLE DR [N]"
-      const outC = [];
-      const seenC = new Set();
-      const headerRe = /^(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\s+(START|STOP|DEST|ORIGIN)\b\s*(.*)$/i;
-
-      for (let i=0;i<lines.length;i++) {
-        const line0 = normalizeStreetTypes(lines[i]);
-        const m = line0.match(headerRe);
-        if (!m) continue;
-
-        const kind = (m[2] || "").toUpperCase();
-        let payload = cleanLine(m[3] || "");
-        payload = normalizeSlashes(payload);
-        payload = stripBracketDir(payload);
-        payload = stripTrailingPickupCount(payload);
-        payload = normalizeSlashes(payload);
-        // Block end (next header)
-        let j = i + 1;
-        while (j < lines.length) {
-          const maybe = normalizeStreetTypes(lines[j]);
-          if (maybe.match(headerRe)) break;
-          j++;
-        }
-
-        if (kind !== "STOP") continue;
-
-        if (!payload) continue;
-        if (ignoreDepot && looksLikeDepotText(payload)) continue;
-
-        // Prefer a clean address inside the STOP block (often in the PICKUP column)
-        let best = "";
-        const blockLines = lines.slice(i, j).map(x => normalizeStreetTypes(cleanLine(x)));
-
-        let payloadStreetKey = "";
-        const payloadStreetMatch = payload.match(/^\d.*?\s+([A-Z0-9\s]+?\s+(?:ST|AVE|RD|BLVD|DR|LN|CT|PL|TER|PKWY|WAY|HWY|DRWY|TRL|CIR|CRVE))\b/i);
-        if (payloadStreetMatch) payloadStreetKey = cleanLine(payloadStreetMatch[1] || "").toUpperCase();
-
-        for (const bl of blockLines) {
-          if (!bl) continue;
-          const bl2 = stripBracketDir(normalizeSlashes(bl));
-          if (isTurnInstruction(bl2)) continue;
-
-          const U = bl2.toUpperCase();
-          if (U.includes("PICKUP") || U.includes("DROPOFF")) continue;
-          if (U.startsWith("DAYS:") || U.startsWith("SCHOOL:") || U.startsWith("GRADE:")) continue;
-          if (!singleAddrRe.test(bl2)) continue;
-          if (ignoreDepot && looksLikeDepotText(bl2)) continue;
-
-          if (payloadStreetKey && U.includes(payloadStreetKey)) {
-            best = bl2;
-            break;
-          }
-          if (!best) best = bl2;
-        }
-
-        let stop = best || payload;
-
-        if (captureIntersections) {
-          stop = stop.replace(/\s*@\s*/g, " & ").replace(/\s+AT\s+/ig, " & ");
-          stop = normalizeSlashes(stop);
-        }
-
-        stop = cleanLine(stop.replace(/\.+$/g, ""));
-        stop = appendDefaultPlace(stop, defaultPlace);
-
-        const key = stop.toLowerCase();
-        if (seenC.has(key)) continue;
-        seenC.add(key);
-        outC.push(stop);
-      }
-      if (outC.length > 0) return outC;
-
-      // 4) Fallback: address lines and loose intersections
-      const addrLineRegex = new RegExp("^\\d{1,6}\\s+.+\\s+" + streetTypes + "\\b.*$", "i");
-      const interRegexLoose = new RegExp("^(.+?\\s+" + streetTypes + ")\\s*(?:&|@|/|\\\\|\\bAND\\b|\\bAT\\b)\\s*(.+)$", "i");
-
+      // 1) General scanning for First Planning / Flagler style:
+      // We look for lines containing STOP/(stop) and then grab the address on the same line
+      // OR the next few lines.
       const out = [];
       const seen = new Set();
 
-      for (let i=0;i<lines.length;i++) {
-        let line = normalizeStreetTypes(lines[i]);
+      // Common header-ish lines to ignore entirely
+      const ignoreLineRe = /^(ROUTE:|BUS:|DRIVER:|ANCHOR:|START\s+TIME:|END\s+TIME:|TOTAL|DISTANCE:|ROUTE\s+DAYS:|SCHEDULE\s+DAY:|PAGE\s+\d+|BUS\s+DRIVER\s+DIRECTIONS|FIRST\s+PLANNING\s+SOLUTIONS|FLAGLER\s+COUNTY|SAN\s+BERNARDINO|NOTES:|PICK\s*UP|DROP\s*OFF)\b/i;
+
+      for (let i = 0; i < linesRaw.length; i++) {
+        let line = linesRaw[i];
+        if (!line) continue;
+        if (ignoreLineRe.test(line)) continue;
+
+        // Normalize only safe things
         line = normalizeSlashes(line);
         line = stripBracketDir(line);
-        if (!line) continue;
+        line = stripTrailingPickupCount(line);
 
-        if (isTurnInstruction(line)) continue;
+        const upper = line.toUpperCase();
 
-        let stop = null;
+        const hasStopKeyword =
+          /\bSTOP\b/.test(upper) ||
+          /\(\s*STOP\s*\)/.test(upper);
 
-        if (addrLineRegex.test(line)) {
-          stop = line;
-        } else if (captureIntersections) {
-          const m = line.match(interRegexLoose);
-          if (m) stop = cleanLine(m[1]) + " & " + cleanLine(m[2]);
+        if (!hasStopKeyword) continue;
+
+        // Skip START/DEST rows (we treat those as optional destination, not pickups)
+        if (/\bSTART\b/.test(upper) || /\bDEST\b/.test(upper) || /\bORIGIN\b/.test(upper) || /\bARRIVE\b/.test(upper) || /\bEND\b/.test(upper)) {
+          continue;
         }
 
-        if (!stop) continue;
-        if (ignoreDepot && looksLikeDepotText(stop)) continue;
+        // Attempt 1: address is on the same line after STOP token
+        let candidate = "";
+        // Remove leading time like "6:52 am"
+        let noTime = line.replace(/^\s*\d{1,2}:\d{2}\s*(am|pm)?\s*/i, "").trim();
 
-        stop = appendDefaultPlace(stop, defaultPlace);
+        // Remove "STOP" and any parenthetical stop numbers "(stop) (12)"
+        noTime = noTime.replace(/\(\s*stop\s*\)\s*\(\s*\d+\s*\)\s*/i, "")
+                       .replace(/\bSTOP\b\s*/i, "")
+                       .replace(/^\(\s*\d+\s*\)\s*/,"")
+                       .trim();
 
-        const key = stop.toLowerCase();
+        // Some lines are like: "STOP 154/158/157 WALTON DR [E]"
+        // After stripping, what's left should be the address-ish bit.
+        if (looksLikeAddress(noTime)) {
+          candidate = noTime;
+        } else {
+          // Attempt 2: address is in the next 1-3 lines (common in OCR where STOP and address split)
+          for (let k = 1; k <= 3 && (i + k) < linesRaw.length; k++) {
+            let look = linesRaw[i + k];
+            if (!look) continue;
+            if (ignoreLineRe.test(look)) continue;
+            look = normalizeSlashes(look);
+            look = stripBracketDir(look);
+            look = stripTrailingPickupCount(look);
+
+            // Avoid picking up student names: they are often "LAST FIRST" without street type/number
+            // We'll require it to look like address
+            if (looksLikeAddress(look)) { candidate = look; break; }
+          }
+        }
+
+        if (!candidate) continue;
+
+        candidate = cleanLine(candidate);
+        candidate = normalizeSlashes(candidate);       // KEEP slashes, just normalize spacing
+        candidate = stripBracketDir(candidate);
+        candidate = stripTrailingPickupCount(candidate);
+        candidate = normalizeIntersection(candidate);
+
+        if (!candidate) continue;
+        if (ignoreDepot && looksLikeDepotText(candidate)) continue;
+
+        // Append default place if not present
+        candidate = appendDefaultPlace(candidate, defaultPlace);
+
+        const key = candidate.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push(stop);
+        out.push(candidate);
       }
 
       return out;
@@ -458,17 +443,27 @@
           const f = files[i];
           setProgress(Math.round((i / files.length) * 100), `OCR image ${i+1} of ${files.length}…`);
 
-          const { data } = await Tesseract.recognize(f, "eng", {
-            logger: m => {
-              if (m.status === "recognizing text") {
-                const base = (i / files.length) * 100;
-                const add = m.progress * (100 / files.length);
-                setProgress(Math.round(base + add), `OCR ${i+1}/${files.length}: ${Math.round(m.progress*100)}%`);
+          try {
+            const { data } = await Tesseract.recognize(f, "eng", {
+              logger: m => {
+                if (m.status === "recognizing text") {
+                  const base = (i / files.length) * 100;
+                  const add = m.progress * (100 / files.length);
+                  setProgress(Math.round(base + add), `OCR ${i+1}/${files.length}…`);
+                }
               }
-            }
-          });
+            });
 
-          combined += `\n\n----- IMAGE ${i+1} -----\n` + (data.text || "");
+            const txt = (data && data.text) ? data.text : "";
+            if (txt.trim()) {
+              combined += `\n\n----- IMAGE ${i+1} (${f.name}) -----\n` + txt;
+            } else {
+              combined += `\n\n----- IMAGE ${i+1} (${f.name}) -----\n` + "[NO TEXT DETECTED]";
+            }
+          } catch (err) {
+            // Don't abort the whole run if one image fails on iOS; continue with the rest.
+            combined += `\n\n----- IMAGE ${i+1} (${f.name}) -----\n` + `[OCR FAILED: ${String(err)}]`;
+          }
         }
 
         els.raw.value = combined.trim();
@@ -496,7 +491,7 @@
         }
       } catch (e) {
         console.error(e);
-        els.status.textContent = "OCR failed. Try clearer images or higher contrast.";
+        els.status.textContent = "OCR finished. If some pages show [OCR FAILED] in the raw output, try re-scanning those pages.";
       } finally {
         els.analyze.disabled = false;
         setAnalyzeEnabled();
